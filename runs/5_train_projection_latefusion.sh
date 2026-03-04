@@ -55,9 +55,9 @@ done
 done
 done
 done
-  --wo_recsys \
-  --zero_shot \
-  --use_pref \
+  # --wo_recsys \
+  # --zero_shot \
+  # --use_pref \
   # --item_target_names_str review_description \
   # --use_pre_train \
   # --zero_shot \

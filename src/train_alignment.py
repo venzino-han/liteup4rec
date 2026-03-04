@@ -408,12 +408,42 @@ def test_fusion_model(
     return test_loss, total_user_embs, None  # Return None for item_embs since we'll use weighted scoring
 
 
+def compute_item_popularity(train_user_seq_data, train_user_target):
+    """
+    Compute item interaction counts from training data.
+
+    Returns:
+        item_popularity (dict): item_id -> interaction count
+        warm_item_set (set): top-20% popular item IDs (warm)
+        total_train_interactions (int): sum of all interaction counts
+    """
+    item_popularity = {}
+    for user_id, seq in train_user_seq_data.items():
+        for item_id in seq:
+            item_popularity[item_id] = item_popularity.get(item_id, 0) + 1
+        target = train_user_target[user_id]
+        item_popularity[target] = item_popularity.get(target, 0) + 1
+
+    total_train_interactions = sum(item_popularity.values())
+
+    sorted_items = sorted(item_popularity.keys(), key=lambda x: item_popularity[x], reverse=True)
+    warm_cutoff = max(1, int(len(sorted_items) * 0.2))
+    warm_item_set = set(sorted_items[:warm_cutoff])
+
+    print(f"[Popularity] Total items: {len(item_popularity)}, "
+          f"Warm (top 20%): {len(warm_item_set)}, "
+          f"Total interactions: {total_train_interactions}")
+    return item_popularity, warm_item_set, total_train_interactions
+
+
     # test the model
 def evaluate_model(
-    model, data_loader, user_seq_data, user_target, device, split_name, args):
+    model, data_loader, user_seq_data, user_target, device, split_name, args,
+    item_popularity=None, warm_item_set=None, total_train_interactions=0,
+):
     """
     Evaluate model performance and save results to CSV file (batch processing version).
-    
+
     Args:
         model: Trained model
         data_loader: DataLoader for the split
@@ -422,12 +452,15 @@ def evaluate_model(
         device: Device to use
         split_name: Name of the split (train/valid/test)
         args: Arguments
+        item_popularity: dict[item_id -> interaction count] from train set
+        warm_item_set: set of warm item IDs (top-20% by popularity)
+        total_train_interactions: total number of train interactions (for novelty)
     """
     # Get predictions
     loss, pred_user_embs, _ = test_fusion_model(
         model, data_loader, device=str(device)
     )
-    
+
     print(f"shape of user_pred_embs ({split_name}):", pred_user_embs.shape)
 
     hit_results = {
@@ -437,7 +470,18 @@ def evaluate_model(
         "hit@10": [],
         "hit@100": [],
         "hit@500": [],
+        # novelty of recommendation list (mean log-inverse-popularity of top-k)
+        "novelty@5": [],
+        "novelty@10": [],
+        # novelty-weighted hit/ndcg (target item novelty * hit/ndcg)
+        "novelty_hit@5": [],
+        "novelty_hit@10": [],
+        "novelty_ndcg@5": [],
+        "novelty_ndcg@10": [],
     }
+    warm_results = {"hit@5": [], "hit@10": [], "ndcg@5": [], "ndcg@10": []}
+    cold_results = {"hit@5": [], "hit@10": [], "ndcg@5": [], "ndcg@10": []}
+
     result_dict_list = []
     num_users = pred_user_embs.shape[0]
     num_items = model.llm_item_embs.shape[0]
@@ -445,69 +489,104 @@ def evaluate_model(
 
     pred_item_embs = model.get_item_emb(model.llm_item_embs, model.cf_item_embs, is_training=False)
     print(f"shape of pred_item_embs ({split_name}):", pred_item_embs.shape)
-    
+
     # Batch compute similarities: [N, M]
     print("Computing similarities for all users...")
     similarities = pred_user_embs @ pred_item_embs.T  # [N, M]
-    
+
     # Create mask for history items
     print("Creating history mask...")
     mask = torch.zeros((num_users, num_items), dtype=torch.bool, device=device)
-    
+
     for user_id, history_iids in tqdm(user_seq_data.items(), total=len(user_seq_data)):
-        # Filter out history items based on split
         if split_name == "train":
             history_to_mask = history_iids[:-2]
         elif split_name == "valid":
             history_to_mask = history_iids[:-1]
         else:  # test
             history_to_mask = history_iids
-        
-        # Add padding item (0) to mask
+
         history_to_mask = history_to_mask + [0]
-        target_item_id = user_target[user_id]
         history_to_mask = list(set(history_to_mask) - set([0]))
         mask[user_id-1, history_to_mask] = True
-    
+
     # Apply mask: set masked items to -inf
     similarities[mask] = float('-inf')
-    
+
     # Get top-k items for all users at once
     print("Getting top-k items...")
     top_scores, top_indices = torch.topk(similarities, k=500, dim=1)  # [N, 500]
     top_scores = top_scores.cpu()
     top_indices = top_indices.cpu()
-    
+
+    # Novelty helpers
+    use_novelty = (item_popularity is not None) and (total_train_interactions > 1)
+    log_total = np.log2(total_train_interactions) if use_novelty else 1.0
+
+    def get_novelty(item_id):
+        """log2(N / count) — higher value means less popular (more novel)."""
+        count = max(item_popularity.get(item_id, 1), 1)
+        return np.log2(total_train_interactions / count)
+
     # Process each user
     print("Processing results...")
     for user_id, history_iids in user_seq_data.items():
         target_item_id = user_target[user_id]
         user_idx = user_id - 1
-        
-        # Get top items and scores for this user
+
         user_top_indices = top_indices[user_idx].tolist()
         user_top_scores = top_scores[user_idx].tolist()
-        
-        # Find rank of target item
+
         if target_item_id not in user_top_indices:
             rank = 501
         else:
             rank = user_top_indices.index(target_item_id)
 
-        # Calculate metrics
         hit_list = [1 if item == target_item_id else 0 for item in user_top_indices]
-        hit_results["ndcg@5"].append(calculate_ndcg(hit_list, 5))
-        hit_results["ndcg@10"].append(calculate_ndcg(hit_list, 10))
-        hit_results["hit@5"].append(calculate_hit_rate(hit_list, 5))
-        hit_results["hit@10"].append(calculate_hit_rate(hit_list, 10))
-        hit_results["hit@100"].append(calculate_hit_rate(hit_list, 100))
-        hit_results["hit@500"].append(calculate_hit_rate(hit_list, 500))
 
-        # Store results
-        top_item_ids = " ".join([str(iid) for iid in user_top_indices])
-        top_scores_str = " ".join([str(round(score,2)) for score in user_top_scores])
+        # --- standard metrics ---
+        hit5  = calculate_hit_rate(hit_list, 5)
+        hit10 = calculate_hit_rate(hit_list, 10)
+        hit100 = calculate_hit_rate(hit_list, 100)
+        hit500 = calculate_hit_rate(hit_list, 500)
+        ndcg5  = calculate_ndcg(hit_list, 5)
+        ndcg10 = calculate_ndcg(hit_list, 10)
 
-        # Get history for display
+        hit_results["hit@5"].append(hit5)
+        hit_results["hit@10"].append(hit10)
+        hit_results["hit@100"].append(hit100)
+        hit_results["hit@500"].append(hit500)
+        hit_results["ndcg@5"].append(ndcg5)
+        hit_results["ndcg@10"].append(ndcg10)
+
+        # --- warm / cold ---
+        if warm_item_set is not None:
+            bucket = warm_results if target_item_id in warm_item_set else cold_results
+            bucket["hit@5"].append(hit5)
+            bucket["hit@10"].append(hit10)
+            bucket["ndcg@5"].append(ndcg5)
+            bucket["ndcg@10"].append(ndcg10)
+
+        # --- novelty ---
+        if use_novelty:
+            # average novelty of the top-k recommendation list
+            for k, hit_results_k in [(5, "novelty@5"), (10, "novelty@10")]:
+                avg_nov = float(np.mean([get_novelty(i) for i in user_top_indices[:k]]))
+                hit_results[hit_results_k].append(avg_nov)
+
+            # novelty-weighted hit / ndcg: weight = normalized novelty of target item
+            target_nov  = get_novelty(target_item_id)
+            norm_nov    = target_nov / log_total if log_total > 0 else 0.0
+
+            hit_results["novelty_hit@5"].append(norm_nov * hit5)
+            hit_results["novelty_hit@10"].append(norm_nov * hit10)
+            hit_results["novelty_ndcg@5"].append(norm_nov * ndcg5)
+            hit_results["novelty_ndcg@10"].append(norm_nov * ndcg10)
+
+        # Store per-user result row
+        top_item_ids   = " ".join([str(iid)          for iid   in user_top_indices])
+        top_scores_str = " ".join([str(round(s, 2))  for s     in user_top_scores])
+
         if split_name == "train":
             display_history = history_iids[:-2]
         elif split_name == "valid":
@@ -515,32 +594,46 @@ def evaluate_model(
         else:
             display_history = history_iids
 
-        result = {
+        result_dict_list.append({
             "user_id": user_id,
             "history_item_ids": " ".join([str(iid) for iid in display_history]),
             "target_item_id": target_item_id,
             "top_item_ids": top_item_ids,
             "top_item_scores": top_scores_str,
             "rank": rank,
-        }
+        })
 
-        result_dict_list.append(result)
-        
         # Print metrics periodically
         if user_id % args.check_interval == 0:
-            print(f"Processed {user_id} samples in {len(user_target)} ({split_name})")
-            avg_results = {k: float(round(np.mean(v),4)) for k, v in hit_results.items()}
+            print(f"Processed {user_id} / {len(user_target)} ({split_name})")
+            partial = {k: float(round(np.mean(v), 4)) for k, v in hit_results.items() if v}
             for k in ["hit@5", "hit@10", "ndcg@5", "ndcg@10", "hit@100", "hit@500"]:
-                v = avg_results[k]
-                print(f"{k:>10}: {v:.4f}")
+                print(f"{k:>10}: {partial.get(k, 0.0):.4f}")
+            if use_novelty:
+                for k in ["novelty@5", "novelty@10", "novelty_hit@5", "novelty_hit@10",
+                          "novelty_ndcg@5", "novelty_ndcg@10"]:
+                    print(f"{k:>20}: {partial.get(k, 0.0):.4f}")
 
-    # Compute average metrics
-    avg_results = {k: float(round(np.mean(v),4)) for k, v in hit_results.items()}
+    # ---- aggregate ----
+    avg_results = {k: float(round(np.mean(v), 4)) for k, v in hit_results.items() if v}
     print(f"Average Metrics ({split_name}):", avg_results)
+
+    if warm_item_set is not None:
+        n_warm = len(warm_results["hit@5"])
+        n_cold = len(cold_results["hit@5"])
+        avg_warm = {f"warm_{k}": float(round(np.mean(v), 4)) if v else 0.0
+                    for k, v in warm_results.items()}
+        avg_cold = {f"cold_{k}": float(round(np.mean(v), 4)) if v else 0.0
+                    for k, v in cold_results.items()}
+        print(f"Warm items (n={n_warm}):", avg_warm)
+        print(f"Cold items (n={n_cold}):", avg_cold)
+        avg_results.update(avg_warm)
+        avg_results.update(avg_cold)
 
     # Save results to CSV file
     results_df = pd.DataFrame(result_dict_list)
-    csv_filename = f"results/embedding_training_{args.data_name}_{args.run_name}_{args.model_name}_{split_name}.csv"
+    csv_filename = (f"results/embedding_training_{args.data_name}_{args.run_name}"
+                    f"_{args.model_name}_{split_name}.csv")
     results_df.to_csv(csv_filename, index=False)
     print(f"Results saved to {csv_filename}")
 
@@ -551,19 +644,32 @@ def evaluate_model(
 
         with open(output_file, "a") as f:
             f.write("\n\nResults\n")
-            # write time
-            time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            f.write(f"Time: {time}\n")
+            time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"Time: {time_str}\n")
             for key, value in vars(args).items():
                 f.write(f"{key:<26} : {value}\n")
             f.write("---\n")
             for key, value in avg_results.items():
-                line = f"{key.ljust(max_key_length)} : {value:.4f}\n"
-                f.write(line)
-            # Write tab-separated metrics in order: hit@5, ndcg@5, hit@10, ndcg@10
+                f.write(f"{key.ljust(max_key_length)} : {value:.4f}\n")
+
+            # core metrics (tab-separated)
             metrics_order = ["hit@5", "ndcg@5", "hit@10", "ndcg@10"]
-            metrics_line = "\t".join([f"{avg_results[key]:.4f}" for key in metrics_order])
-            f.write(f"{metrics_line}\n")
+            f.write("\t".join([f"{avg_results[k]:.4f}" for k in metrics_order]) + "\n")
+
+            # warm / cold metrics
+            if warm_item_set is not None:
+                wc_keys = ["warm_hit@5", "warm_ndcg@5", "warm_hit@10", "warm_ndcg@10",
+                           "cold_hit@5", "cold_ndcg@5", "cold_hit@10", "cold_ndcg@10"]
+                f.write("warm/cold:\t" +
+                        "\t".join([f"{avg_results.get(k, 0.0):.4f}" for k in wc_keys]) + "\n")
+
+            # novelty metrics
+            if use_novelty:
+                nov_keys = ["novelty@5", "novelty@10",
+                            "novelty_hit@5", "novelty_ndcg@5",
+                            "novelty_hit@10", "novelty_ndcg@10"]
+                f.write("novelty:\t" +
+                        "\t".join([f"{avg_results.get(k, 0.0):.4f}" for k in nov_keys]) + "\n")
 
         print(f"Log metrics saved to {output_file}")
 
@@ -573,11 +679,9 @@ def evaluate_model(
             f.write(f"run_name: {args.run_name}\n")
             f.write(f"seed: {args.seed}\n")
             f.write(f"Data: {args.data_name} \n")
-            # Write tab-separated metrics in order: hit@5, ndcg@5, hit@10, ndcg@10
             metrics_order = ["hit@5", "ndcg@5", "hit@10", "ndcg@10"]
-            metrics_line = "\t".join([f"{avg_results[key]:.4f}" for key in metrics_order])
-            f.write(f"{metrics_line}\n")
-            f.write(f"--------------------------------\n")
+            f.write("\t".join([f"{avg_results[k]:.4f}" for k in metrics_order]) + "\n")
+            f.write("--------------------------------\n")
 
     return avg_results
 
@@ -659,6 +763,11 @@ if __name__ == "__main__":
             train_user_target[user_id] = parts[-3]
             val_user_target[user_id] = parts[-2]
             test_user_target[user_id] = parts[-1]
+    # Compute item popularity from train set for warm/cold split and novelty metrics
+    item_popularity, warm_item_set, total_train_interactions = compute_item_popularity(
+        train_user_seq_data, train_user_target
+    )
+
     # load the user embeddings
 
     
@@ -785,23 +894,29 @@ if __name__ == "__main__":
 
 
 # Evaluate on all splits
+popularity_kwargs = dict(
+    item_popularity=item_popularity,
+    warm_item_set=warm_item_set,
+    total_train_interactions=total_train_interactions,
+)
+
 if "train" in args.target_split:
     print("Evaluating on train split...")
     train_results = evaluate_model(
-        trained_model, train_eval_loader, train_user_seq_data, train_user_target, 
-        device, "train", args
+        trained_model, train_eval_loader, train_user_seq_data, train_user_target,
+        device, "train", args, **popularity_kwargs
     )
 
 if "val" in args.target_split:
     print("Evaluating on validation split...")
     valid_results = evaluate_model(
-        trained_model, valid_loader, val_user_seq_data, val_user_target, 
-        device, "valid", args
+        trained_model, valid_loader, val_user_seq_data, val_user_target,
+        device, "valid", args, **popularity_kwargs
     )
 
 if "test" in args.target_split:
     print("Evaluating on test split...")
     test_results = evaluate_model(
-        trained_model, test_loader, test_user_seq_data, test_user_target, 
-        device, "test", args
+        trained_model, test_loader, test_user_seq_data, test_user_target,
+        device, "test", args, **popularity_kwargs
     )
